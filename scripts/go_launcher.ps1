@@ -1,64 +1,76 @@
-param (
-    # Hardcoded GO LAUNCHER config only
-    [switch]$force_go_install,
-    [string]$go_version = "latest",
-    [switch]$check_ports,
-    [switch]$stop_existing,
-    [switch]$background = $true,
-    [int]$timeout_seconds = 0,
-    [switch]$verbose,
+#Requires -Version 5.1
 
-    # Everything else is kwargs for Go
-    [Parameter(ValueFromRemainingArguments=$true)]
-    [string[]]$kwargs
+[CmdletBinding()]
+param (
+    [Parameter(Mandatory=$true, Position=0, HelpMessage="Path to the Go file to execute")]
+    [ValidateScript({
+        if (-not (Test-Path $_)) { throw "Go file not found: $_" }
+        if (-not $_.EndsWith(".go")) { throw "File must have .go extension" }
+        return $true
+    })]
+    [string]$GoFile,
+
+    [Parameter(HelpMessage="Go arguments as JSON array (e.g., '[`"--port`", `"8080`", `"--verbose`"]')")]
+    [string]$GoArgs = "[]",
+
+    [Parameter(HelpMessage="Go version to install (default: latest)")]
+    [string]$GoVersion = "latest",
+
+    [Parameter(HelpMessage="Force Go installation even if already present")]
+    [switch]$ForceGoInstall,
+
+    [Parameter(HelpMessage="Enable server mode with port management")]
+    [switch]$ServerMode,
+
+    [Parameter(HelpMessage="Port for server mode (auto-detected from GoArgs if not specified)")]
+    [ValidateRange(1, 65535)]
+    [int]$Port = 0,
+
+    [Parameter(HelpMessage="Kill existing processes on the target port")]
+    [switch]$StopExisting,
+
+    [Parameter(HelpMessage="Dry run - show what would be executed without running")]
+    [switch]$DryRun
 )
 
-$ErrorActionPreference = "Stop"
+# Global script variables
+$script:VerboseEnabled = $VerbosePreference -ne 'SilentlyContinue'
 
 function Write-Log {
-    param([string]$Message, [string]$Color = "White")
-    if ($verbose) {
-        Write-Host "[GO-LAUNCHER] $Message" -ForegroundColor $Color
+    param(
+        [string]$Message,
+        [ValidateSet("INFO", "SUCCESS", "WARNING", "ERROR", "DEBUG")]
+        [string]$Level = "INFO"
+    )
+
+    if (-not $script:VerboseEnabled -and $Level -eq "DEBUG") {
+        return
     }
-}
 
-function Install-GoIfNeeded {
-    if ($force_go_install -or -not (Get-Command go -ErrorAction SilentlyContinue)) {
-        Write-Log "Installing Go..." "Yellow"
-
-        try {
-            if ($go_version -eq "latest") {
-                $response = Invoke-RestMethod "https://api.github.com/repos/golang/go/tags" -UseBasicParsing
-                $version = ($response | Where-Object { $_.name -match "^go\d+\.\d+\.\d+$" } | Select-Object -First 1).name -replace "go", ""
-            } else {
-                $version = $go_version
-            }
-
-            $downloadUrl = "https://go.dev/dl/go$version.windows-amd64.msi"
-            $tempFile = "$env:TEMP\go$version.msi"
-
-            Invoke-WebRequest $downloadUrl -OutFile $tempFile -UseBasicParsing
-            Start-Process msiexec -ArgumentList "/i", $tempFile, "/quiet" -Wait
-
-            $env:PATH += ";C:\Program Files\Go\bin"
-            Remove-Item $tempFile -ErrorAction SilentlyContinue
-
-            Write-Log "Go installed successfully" "Green"
-        } catch {
-            throw "Failed to install Go: $_"
-        }
+    $colors = @{
+        "INFO"    = "White"
+        "SUCCESS" = "Green"
+        "WARNING" = "Yellow"
+        "ERROR"   = "Red"
+        "DEBUG"   = "Gray"
     }
+
+    $timestamp = Get-Date -Format "HH:mm:ss"
+    $prefix = "[$timestamp] [$Level]"
+    Write-Host "$prefix $Message" -ForegroundColor $colors[$Level]
 }
 
 function Test-PortAvailable {
-    param([int]$Port)
+    param([int]$PortNumber)
 
     try {
-        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $Port)
+        $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $PortNumber)
         $listener.Start()
         $listener.Stop()
+        $listener.Dispose()
         return $true
-    } catch {
+    }
+    catch {
         return $false
     }
 }
@@ -66,99 +78,205 @@ function Test-PortAvailable {
 function Find-AvailablePort {
     param([int]$StartPort = 3000)
 
-    for ($p = $StartPort; $p -le 9999; $p++) {
-        if (Test-PortAvailable $p) {
+    for ($p = $StartPort; $p -le 65535; $p++) {
+        if (Test-PortAvailable -PortNumber $p) {
+            Write-Log "Found available port: $p" -Level "SUCCESS"
             return $p
         }
     }
-    throw "No available ports found"
+    throw "No available ports found in range $StartPort-65535"
 }
 
-function Parse-KwargsToGoArgs {
-    param([string[]]$RawKwargs)
+function Stop-PortProcess {
+    param([int]$PortNumber)
 
-    $goArgs = @()
-    $i = 0
+    Write-Log "Stopping processes on port $PortNumber" -Level "WARNING"
 
-    while ($i -lt $RawKwargs.Length) {
-        $arg = $RawKwargs[$i]
+    try {
+        $connections = Get-NetTCPConnection -LocalPort $PortNumber -State Listen -ErrorAction SilentlyContinue
+        if (-not $connections) {
+            Write-Log "No processes found on port $PortNumber" -Level "DEBUG"
+            return
+        }
 
-        if ($arg.StartsWith("-")) {
-            # This is a flag
-            $flag = $arg
-
-            # Check if next arg is a value (doesn't start with -)
-            if (($i + 1) -lt $RawKwargs.Length -and -not $RawKwargs[$i + 1].StartsWith("-")) {
-                $value = $RawKwargs[$i + 1]
-                $goArgs += $flag, $value
-                $i += 2
-            } else {
-                # Boolean flag
-                $goArgs += $flag
-                $i += 1
+        foreach ($conn in $connections) {
+            $process = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+            if ($process) {
+                Write-Log "Killing process: $($process.ProcessName) (PID: $($process.Id))" -Level "WARNING"
+                if (-not $DryRun) {
+                    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                }
             }
-        } else {
-            # Standalone value
-            $goArgs += $arg
-            $i += 1
         }
     }
-
-    return $goArgs
+    catch {
+        Write-Log "Error stopping port processes: $($_.Exception.Message)" -Level "ERROR"
+    }
 }
 
-# Main execution
-try {
-    Write-Log "Starting Go launcher..." "Cyan"
+function Get-ProcessedArgs {
+    param(
+        [array]$Arguments,
+        [bool]$IsServerMode,
+        [int]$ExplicitPort
+    )
 
-    # Install Go if needed (launcher responsibility)
-    Install-GoIfNeeded
+    if (-not $IsServerMode) {
+        return $Arguments
+    }
 
-    # Parse all kwargs into Go arguments
-    $goArgs = Parse-KwargsToGoArgs $kwargs
+    $args = $Arguments.Clone()
+    $targetPort = $ExplicitPort
 
-    Write-Log "Parsed Go args: $($goArgs -join ' ')" "Gray"
-
-    # Handle port management if requested (launcher responsibility)
-    if ($check_ports) {
-        # Extract port from kwargs if present
-        $portIndex = [array]::IndexOf($goArgs, "-port")
-        if ($portIndex -ge 0 -and ($portIndex + 1) -lt $goArgs.Length) {
-            $port = [int]$goArgs[$portIndex + 1]
-
-            if (-not (Test-PortAvailable $port)) {
-                if ($stop_existing) {
-                    Write-Log "Stopping existing process on port $port..." "Yellow"
-                    $proc = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
-                    if ($proc) {
-                        Stop-Process -Id $proc.OwningProcess -Force -ErrorAction SilentlyContinue
-                    }
-                } else {
-                    $newPort = Find-AvailablePort $port
-                    Write-Log "Port $port unavailable, using $newPort" "Yellow"
-                    $goArgs[$portIndex + 1] = $newPort.ToString()
+    # If no explicit port, try to find one in args
+    if ($targetPort -eq 0) {
+        for ($i = 0; $i -lt $args.Length - 1; $i++) {
+            if ($args[$i] -in @("-port", "--port", "-p")) {
+                try {
+                    $targetPort = [int]$args[$i + 1]
+                    break
+                }
+                catch {
+                    Write-Log "Invalid port value in arguments: $($args[$i + 1])" -Level "WARNING"
                 }
             }
         }
     }
 
-    # Build final Go command: go run + all kwargs
-    $goCmd = @("run") + $goArgs
-
-    Write-Log "Running: go $($goCmd -join ' ')" "Green"
-
-    # Execute Go command
-    if ($background) {
-        $proc = Start-Process -FilePath "go" -ArgumentList $goCmd -PassThru -NoNewWindow
-        Write-Host "✓ Go server started (PID: $($proc.Id))" -ForegroundColor Green
-
-        # Keep the process alive
-        $proc.WaitForExit()
-    } else {
-        Start-Process -FilePath "go" -ArgumentList $goCmd -Wait -NoNewWindow
+    if ($targetPort -eq 0) {
+        Write-Log "No port specified for server mode" -Level "DEBUG"
+        return $args
     }
 
-} catch {
-    Write-Host "❌ Failed to start Go server: $_" -ForegroundColor Red
+    Write-Log "Target port: $targetPort" -Level "DEBUG"
+
+    if (-not (Test-PortAvailable -PortNumber $targetPort)) {
+        if ($StopExisting) {
+            Stop-PortProcess -PortNumber $targetPort
+        }
+        else {
+            $newPort = Find-AvailablePort -StartPort $targetPort
+            Write-Log "Replacing port $targetPort with $newPort" -Level "WARNING"
+
+            # Update port in args
+            for ($i = 0; $i -lt $args.Length - 1; $i++) {
+                if ($args[$i] -in @("-port", "--port", "-p")) {
+                    $args[$i + 1] = $newPort.ToString()
+                    break
+                }
+            }
+        }
+    }
+
+    return $args
+}
+
+function Install-GoRuntime {
+    param(
+        [string]$Version,
+        [bool]$Force
+    )
+
+    $goInstalled = $null -ne (Get-Command go -ErrorAction SilentlyContinue)
+
+    if ($goInstalled -and -not $Force) {
+        $currentVersion = (go version 2>$null) -replace "go version go", "" -replace " .*", ""
+        Write-Log "Go already installed: $currentVersion" -Level "SUCCESS"
+        return
+    }
+
+    if ($DryRun) {
+        Write-Log "[DRY RUN] Would install Go version: $Version" -Level "INFO"
+        return
+    }
+
+    Write-Log "Installing Go..." -Level "INFO"
+
+    try {
+        $installVersion = $Version
+
+        if ($installVersion -eq "latest") {
+            Write-Log "Resolving latest Go version..." -Level "DEBUG"
+            $response = Invoke-RestMethod "https://api.github.com/repos/golang/go/tags" -UseBasicParsing
+            $latestTag = $response | Where-Object { $_.name -match "^go\d+\.\d+\.\d+$" } | Select-Object -First 1
+
+            if (-not $latestTag) {
+                throw "Could not determine latest Go version"
+            }
+
+            $installVersion = $latestTag.name -replace "go", ""
+        }
+
+        $downloadUrl = "https://go.dev/dl/go$installVersion.windows-amd64.msi"
+        $tempFile = Join-Path $env:TEMP "go$installVersion.msi"
+
+        Write-Log "Downloading Go $installVersion..." -Level "INFO"
+        Invoke-WebRequest $downloadUrl -OutFile $tempFile -UseBasicParsing
+
+        Write-Log "Installing Go $installVersion..." -Level "INFO"
+        $process = Start-Process msiexec -ArgumentList "/i", $tempFile, "/quiet" -Wait -PassThru
+
+        if ($process.ExitCode -ne 0) {
+            throw "Go installation failed with exit code: $($process.ExitCode)"
+        }
+
+        # Update PATH for current session
+        $goPath = "C:\Program Files\Go\bin"
+        if ($env:PATH -notlike "*$goPath*") {
+            $env:PATH += ";$goPath"
+        }
+
+        Remove-Item $tempFile -ErrorAction SilentlyContinue
+        Write-Log "Go $installVersion installed successfully" -Level "SUCCESS"
+    }
+    catch {
+        throw "Go installation failed: $($_.Exception.Message)"
+    }
+}
+
+# Main execution
+$ErrorActionPreference = "Stop"
+
+try {
+    # Parse JSON arguments
+    try {
+        $parsedArgs = ConvertFrom-Json $GoArgs
+        if (-not ($parsedArgs -is [array])) {
+            throw "GoArgs must be a JSON array"
+        }
+    }
+    catch {
+        throw "Invalid JSON in GoArgs parameter: $($_.Exception.Message)"
+    }
+
+    # Ensure Go is installed
+    Install-GoRuntime -Version $GoVersion -Force $ForceGoInstall.IsPresent
+
+    # Process arguments for server mode
+    $processedArgs = Get-ProcessedArgs -Arguments $parsedArgs -IsServerMode $ServerMode.IsPresent -ExplicitPort $Port
+
+    # Build command
+    $command = @("run", $GoFile) + $processedArgs
+    $commandStr = "go " + ($command -join " ")
+
+    Write-Log "Executing: $commandStr" -Level "INFO"
+
+    if ($DryRun) {
+        Write-Log "[DRY RUN] Command would be executed" -Level "INFO"
+        exit 0
+    }
+
+    # Execute Go command
+    & go @command
+
+    if ($LASTEXITCODE -eq 0) {
+        Write-Log "Execution completed successfully" -Level "SUCCESS"
+    }
+    else {
+        throw "Go execution failed with exit code: $LASTEXITCODE"
+    }
+}
+catch {
+    Write-Log "Error: $($_.Exception.Message)" -Level "ERROR"
     exit 1
 }
