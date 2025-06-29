@@ -6,8 +6,11 @@ from pygops import GoServer
 
 async def test_advanced():
     path = Path.cwd() / "scripts" / "go_dummy.go"
-    server = GoServer(str(path), port=8080, verbose=True)
-    await server.start()
+    server = GoServer(str(path), port=3333, verbose=True)
+    try:
+        await server.start()
+    except Exception as e:
+        raise RuntimeError(e)
 
     if await server.is_running():
         print(f"✓ Advanced server running at {server.url}")

@@ -76,26 +76,18 @@ function Write-Log {
 function Test-PortAvailable {
     param([int]$PortNumber)
 
+    Write-Log "Testing port availability: $PortNumber" -Level "DEBUG"
     try {
-        Write-Log "Testing port availability: $PortNumber" -Level "DEBUG"
         $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $PortNumber)
         $listener.Start()
         $listener.Stop()
-
-        # Don't call Dispose() - it doesn't exist in older PowerShell versions
-        # The Stop() method is sufficient to release the port
-        $listener = $null  # Help with garbage collection
-
+        $listener = $null
         Write-Log "Port $PortNumber is available" -Level "DEBUG"
         return $true
     }
     catch {
         Write-Log "Port $PortNumber is not available: $($_.Exception.Message)" -Level "DEBUG"
-        # Make sure listener is cleaned up even on error
-        if ($listener) {
-            try { $listener.Stop() } catch { }
-            $listener = $null
-        }
+        if ($listener) { try { $listener.Stop() } catch { } ; $listener = $null }
         return $false
     }
 }
@@ -104,37 +96,28 @@ function Find-AvailablePort {
     param([int]$StartPort = 3000)
 
     Write-Log "Searching for available port starting from: $StartPort" -Level "DEBUG"
+    $maxPort = [Math]::Min(65535, $StartPort + 1000)
 
-    try {
-        # Limit search to prevent infinite loops
-        $maxPort = [Math]::Min(65535, $StartPort + 1000)
-
-        for ($p = $StartPort; $p -le $maxPort; $p++) {
-            try {
-                Write-Log "Checking port: $p" -Level "DEBUG"
-
-                if (Test-PortAvailable -PortNumber $p) {
-                    Write-Log "Found available port: $p" -Level "SUCCESS"
-                    return $p
-                }
-            }
-            catch {
-                Write-Log "Error testing port $p : $($_.Exception.Message)" -Level "WARNING"
-                # Continue to next port instead of crashing
-                continue
+    for ($p = $StartPort; $p -le $maxPort; $p++) {
+        Write-Log "Checking port: $p" -Level "DEBUG"
+        if (Test-PortAvailable -PortNumber $p) {
+            Write-Log "Found available port: $p" -Level "SUCCESS"
+            return $p
+        }
+        else {
+            Write-Log "Port $p busy. attempting to clear it…" -Level "DEBUG"
+            Stop-PortProcess -PortNumber $p
+            Start-Sleep -Seconds 1
+            if (Test-PortAvailable -PortNumber $p) {
+                Write-Log "Now free: $p" -Level "SUCCESS"
+                return $p
             }
         }
+    }
 
-        # If we get here, no port was found in the range
-        $errorMsg = "No available ports found in range $StartPort-$maxPort"
-        Write-Log $errorMsg -Level "ERROR"
-        throw $errorMsg
-    }
-    catch {
-        Write-Log "Critical error in Find-AvailablePort: $($_.Exception.Message)" -Level "ERROR"
-        Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level "ERROR"
-        throw "Port search failed: $($_.Exception.Message)"
-    }
+    $errorMsg = "No available ports found in range $StartPort-$maxPort"
+    Write-Log $errorMsg -Level "ERROR"
+    throw $errorMsg
 }
 
 function Stop-PortProcess {
@@ -142,47 +125,40 @@ function Stop-PortProcess {
 
     Write-Log "Stopping processes on port $PortNumber" -Level "WARNING"
 
+    # try native cmdlet first
     try {
-        Write-Log "Getting connections for port $PortNumber" -Level "DEBUG"
-        $connections = Get-NetTCPConnection -LocalPort $PortNumber -State Listen -ErrorAction SilentlyContinue -InformationAction SilentlyContinue
-
-        if (-not $connections) {
-            Write-Log "No processes found on port $PortNumber" -Level "DEBUG"
-            return
-        }
-
-        Write-Log "Found $($connections.Count) connection(s) on port $PortNumber" -Level "DEBUG"
-
-        foreach ($conn in $connections) {
-            try {
-                Write-Log "Processing connection with PID: $($conn.OwningProcess)" -Level "DEBUG"
-                $process = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
-
-                if ($process) {
-                    Write-Log "Killing process: $($process.ProcessName) (PID: $($process.Id))" -Level "WARNING"
-                    if (-not $DryRun) {
-                        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
-                        Write-Log "Process $($process.Id) terminated" -Level "DEBUG"
-                    } else {
-                        Write-Log "[DRY RUN] Would kill process $($process.Id)" -Level "INFO"
-                    }
-                } else {
-                    Write-Log "Could not get process for PID: $($conn.OwningProcess)" -Level "WARNING"
-                }
-            }
-            catch {
-                Write-Log "Error processing connection: $($_.Exception.Message)" -Level "WARNING"
-                # Continue with other connections
-                continue
-            }
-        }
+        $conns = Get-NetTCPConnection -LocalPort $PortNumber -State Listen -ErrorAction Stop
     }
     catch {
-        Write-Log "Error in Stop-PortProcess: $($_.Exception.Message)" -Level "ERROR"
-        Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level "ERROR"
-        # Don't re-throw here, as this is not critical to the main flow
+        Write-Log "Get-NetTCPConnection unavailable. falling back to netstat" -Level "DEBUG"
+        $conns = netstat -ano |
+            Select-String ":$PortNumber\s+LISTENING" |
+            ForEach-Object { [PSCustomObject]@{ OwningProcess = ($_ -split '\s+')[-1] } }
     }
+
+    if (-not $conns) {
+        Write-Log "no listeners found on $PortNumber" -Level "DEBUG"
+        return
+    }
+
+    foreach ($c in $conns) {
+        $pid = $c.OwningProcess
+        Write-Log "killing pid $pid" -Level "DEBUG"
+        try { Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue } catch { }
+    }
+
+    # wait for OS TIME_WAIT to clear
+    for ($i=0; $i -lt 5; $i++) {
+        if (Test-PortAvailable -PortNumber $PortNumber) {
+            Write-Log "port $PortNumber is now free" -Level "SUCCESS"
+            return
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    Write-Log "still busy: port $PortNumber didn’t free in time" -Level "ERROR"
 }
+
 
 function Get-ProcessedArgs {
     param(

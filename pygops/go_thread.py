@@ -2,6 +2,7 @@ import subprocess
 import threading
 import json
 from pathlib import Path
+from subprocess import SubprocessError
 from typing import Any, List
 from loguru import logger as log
 
@@ -82,6 +83,8 @@ class GoThread(threading.Thread):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,  # Keep stderr separate for better error analysis
                 text=True,
+                encoding='utf-8',  # Explicitly set encoding to avoid cp1252 issues
+                errors='replace',  # Replace problematic characters instead of crashing
                 cwd=str(Path(self.script_path).parent),  # Run from script directory
                 universal_newlines=True
             )
@@ -163,14 +166,17 @@ class GoThread(threading.Thread):
                 elif ret == 4294967295:
                     log.error("  → PowerShell execution policy may be blocking script")
                     log.error("  → Try: Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope CurrentUser")
+                raise SubprocessError
 
         except FileNotFoundError:
             log.error(f"[GoThread] PowerShell not found - ensure PowerShell is installed")
             log.error(f"  Command attempted: {' '.join(cmd) if 'cmd' in locals() else 'N/A'}")
+            raise FileNotFoundError
         except PermissionError:
             log.error(f"[GoThread] Permission denied executing PowerShell")
             log.error(f"  Script path: {self.script_path}")
             log.error(f"  Go file: {self.go_file}")
+            raise PermissionError
         except Exception as e:
             log.error(f"[GoThread] Unexpected error during PowerShell execution: {e}")
             log.error(f"  Error type: {type(e).__name__}")
@@ -179,6 +185,7 @@ class GoThread(threading.Thread):
                 log.error("  Captured output before error:")
                 for line in stdout_lines[-5:]:
                     log.error(f"    {line}")
+            raise Exception
 
     def terminate(self):
         """Terminate the running process if it exists"""
