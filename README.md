@@ -1,56 +1,79 @@
-# PyGoPS
+# pygops
 
-## What Happens
+Python wrapper for running Go applications via PowerShell.
 
-1. **Python**: All kwargs flow through 3 tiny components
-2. **PowerShell**: Splits kwargs into:
-   - **Launcher config**: `verbose`, `check_ports`, `force_go_install`, etc.
-   - **Go arguments**: Everything else becomes `go run -arg value`
-
-## Launcher vs Go Arguments
-
-### Launcher Config (hardcoded in PowerShell)
-- `force_go_install` - Force Go installation
-- `go_version` - Go version to install  
-- `check_ports` - Check port availability
-- `stop_existing` - Stop conflicting processes
-- `background` - Run in background
-- `timeout_seconds` - Process timeout
-- `verbose` - Enable logging
-
-### Go Arguments (pure passthrough)
-- `port=8080` → `go run -port 8080`
-- `debug=True` → `go run -debug`
-- `config="app.json"` → `go run -config app.json`
-- `database_url="..."` → `go run -database_url ...`
-- **Any kwarg** → **Go flag**
-
-## Examples
-
-```python
-from pygops import GoServer
-
-GoServer(port=8080)
-# Runs: go run -port 8080
-
-# Complex server
-GoServer(
-    port=8080,
-    host="0.0.0.0",
-    database_url="postgres://localhost/db",
-    redis_url="redis://localhost:6379",
-    log_level="debug",
-    enable_metrics=True,
-    jwt_secret="secret",
-    # Launcher config
-    verbose=True,
-    check_ports=True
-)
-# Runs: go run -port 8080 -host 0.0.0.0 -database_url postgres://localhost/db -redis_url redis://localhost:6379 -log_level debug -enable_metrics -jwt_secret secret
-
-# Working directory is wherever you run Python from
-GoServer(project_dir="./my-app", port=3000)
-# Changes to ./my-app and runs: go run -project_dir ./my-app -port 3000
+```bash
+pip install pygops
 ```
 
-Perfect separation: Python handles async, PowerShell handles launcher concerns, everything else is pure Go arguments!
+## Requirements
+
+* Python 3.8 or higher
+* PowerShell installed and accessible in PATH
+* Go installed for running Go applications
+* Dependencies (installed automatically):
+
+  * `loguru`
+  * `toomanyports`
+  * `aiohttp` (for server health checks)
+
+## Usage
+
+### Launch a Go script manually
+
+```python
+from pygops import GoLauncher
+
+launcher = GoLauncher(
+    go_file="path/to/script.go",
+    script_path=script_path,
+    verbose=True,
+    port=5000  # optional: will kill existing or choose random if omitted
+)
+launcher.thread.start()
+```
+
+### Run a Go server with health check
+
+```python
+import asyncio
+from pygops import GoServer, get_go_launcher_script
+
+script = get_go_launcher_script()
+server = GoServer(
+    go_file="path/to/main.go",
+    script_path=script,
+    port=4000,
+    verbose=True
+)
+
+async def main():
+    await server.start()
+    running = await server.is_running()
+    print(f"Server running: {running}")
+    # ... later ...
+    await server.stop()
+
+asyncio.run(main())
+```
+
+### Execute Go script in its own thread
+
+```python
+from pygops import GoThread, get_go_launcher_script
+
+thread = GoThread(
+    go_file="path/to/task.go",
+    script_path=get_go_launcher_script(),
+    go_args=["--flag", "value"],
+    verbose=True
+)
+thread.start()
+# Do other work...
+if thread.is_running():
+    thread.terminate()
+```
+
+## License
+
+Released under the MIT License. See [LICENSE](LICENSE) for details.

@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pygops"
+version = "0.1.0"
+description = "Python wrapper for Go applications with PowerShell launcher"
+authors = [
+  { name = "PyGoPS Team" }
+]
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = [
+  "loguru>=0.5.3",
+  "toomanyports>=0.1",
+  "aiohttp>=3.8.1"
+]
+
+[project.urls]
+Homepage = "https://github.com/yourname/pygops"
