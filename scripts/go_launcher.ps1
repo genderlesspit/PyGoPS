@@ -4,8 +4,21 @@
 param (
     [Parameter(Mandatory=$true, Position=0, HelpMessage="Path to the Go file to execute")]
     [ValidateScript({
-        if (-not (Test-Path $_)) { throw "Go file not found: $_" }
-        if (-not $_.EndsWith(".go")) { throw "File must have .go extension" }
+        # Handle both absolute and relative paths
+        $resolvedPath = if ([System.IO.Path]::IsPathRooted($_)) {
+            # Absolute path - use as-is
+            $_
+        } else {
+            # Relative path - resolve against current working directory
+            Join-Path (Get-Location) $_
+        }
+
+        if (-not (Test-Path $resolvedPath)) {
+            throw "Go file not found: $resolvedPath (original: $_)"
+        }
+        if (-not $resolvedPath.EndsWith(".go")) {
+            throw "File must have .go extension: $resolvedPath"
+        }
         return $true
     })]
     [string]$GoFile,
@@ -64,13 +77,25 @@ function Test-PortAvailable {
     param([int]$PortNumber)
 
     try {
+        Write-Log "Testing port availability: $PortNumber" -Level "DEBUG"
         $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Any, $PortNumber)
         $listener.Start()
         $listener.Stop()
-        $listener.Dispose()
+
+        # Don't call Dispose() - it doesn't exist in older PowerShell versions
+        # The Stop() method is sufficient to release the port
+        $listener = $null  # Help with garbage collection
+
+        Write-Log "Port $PortNumber is available" -Level "DEBUG"
         return $true
     }
     catch {
+        Write-Log "Port $PortNumber is not available: $($_.Exception.Message)" -Level "DEBUG"
+        # Make sure listener is cleaned up even on error
+        if ($listener) {
+            try { $listener.Stop() } catch { }
+            $listener = $null
+        }
         return $false
     }
 }
@@ -78,13 +103,38 @@ function Test-PortAvailable {
 function Find-AvailablePort {
     param([int]$StartPort = 3000)
 
-    for ($p = $StartPort; $p -le 65535; $p++) {
-        if (Test-PortAvailable -PortNumber $p) {
-            Write-Log "Found available port: $p" -Level "SUCCESS"
-            return $p
+    Write-Log "Searching for available port starting from: $StartPort" -Level "DEBUG"
+
+    try {
+        # Limit search to prevent infinite loops
+        $maxPort = [Math]::Min(65535, $StartPort + 1000)
+
+        for ($p = $StartPort; $p -le $maxPort; $p++) {
+            try {
+                Write-Log "Checking port: $p" -Level "DEBUG"
+
+                if (Test-PortAvailable -PortNumber $p) {
+                    Write-Log "Found available port: $p" -Level "SUCCESS"
+                    return $p
+                }
+            }
+            catch {
+                Write-Log "Error testing port $p : $($_.Exception.Message)" -Level "WARNING"
+                # Continue to next port instead of crashing
+                continue
+            }
         }
+
+        # If we get here, no port was found in the range
+        $errorMsg = "No available ports found in range $StartPort-$maxPort"
+        Write-Log $errorMsg -Level "ERROR"
+        throw $errorMsg
     }
-    throw "No available ports found in range $StartPort-65535"
+    catch {
+        Write-Log "Critical error in Find-AvailablePort: $($_.Exception.Message)" -Level "ERROR"
+        Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level "ERROR"
+        throw "Port search failed: $($_.Exception.Message)"
+    }
 }
 
 function Stop-PortProcess {
@@ -93,24 +143,44 @@ function Stop-PortProcess {
     Write-Log "Stopping processes on port $PortNumber" -Level "WARNING"
 
     try {
-        $connections = Get-NetTCPConnection -LocalPort $PortNumber -State Listen -ErrorAction SilentlyContinue
+        Write-Log "Getting connections for port $PortNumber" -Level "DEBUG"
+        $connections = Get-NetTCPConnection -LocalPort $PortNumber -State Listen -ErrorAction SilentlyContinue -InformationAction SilentlyContinue
+
         if (-not $connections) {
             Write-Log "No processes found on port $PortNumber" -Level "DEBUG"
             return
         }
 
+        Write-Log "Found $($connections.Count) connection(s) on port $PortNumber" -Level "DEBUG"
+
         foreach ($conn in $connections) {
-            $process = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
-            if ($process) {
-                Write-Log "Killing process: $($process.ProcessName) (PID: $($process.Id))" -Level "WARNING"
-                if (-not $DryRun) {
-                    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            try {
+                Write-Log "Processing connection with PID: $($conn.OwningProcess)" -Level "DEBUG"
+                $process = Get-Process -Id $conn.OwningProcess -ErrorAction SilentlyContinue
+
+                if ($process) {
+                    Write-Log "Killing process: $($process.ProcessName) (PID: $($process.Id))" -Level "WARNING"
+                    if (-not $DryRun) {
+                        Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                        Write-Log "Process $($process.Id) terminated" -Level "DEBUG"
+                    } else {
+                        Write-Log "[DRY RUN] Would kill process $($process.Id)" -Level "INFO"
+                    }
+                } else {
+                    Write-Log "Could not get process for PID: $($conn.OwningProcess)" -Level "WARNING"
                 }
+            }
+            catch {
+                Write-Log "Error processing connection: $($_.Exception.Message)" -Level "WARNING"
+                # Continue with other connections
+                continue
             }
         }
     }
     catch {
-        Write-Log "Error stopping port processes: $($_.Exception.Message)" -Level "ERROR"
+        Write-Log "Error in Stop-PortProcess: $($_.Exception.Message)" -Level "ERROR"
+        Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level "ERROR"
+        # Don't re-throw here, as this is not critical to the main flow
     }
 }
 
@@ -121,19 +191,33 @@ function Get-ProcessedArgs {
         [int]$ExplicitPort
     )
 
+    Write-Log "Get-ProcessedArgs called with: Args=$($Arguments -join ','), ServerMode=$IsServerMode, Port=$ExplicitPort" -Level "DEBUG"
+
     if (-not $IsServerMode) {
+        Write-Log "Not in server mode, returning original args" -Level "DEBUG"
         return $Arguments
     }
 
-    $args = $Arguments.Clone()
+    # Handle empty args array properly
+    if ($null -eq $Arguments -or $Arguments.Count -eq 0) {
+        Write-Log "Arguments array is empty or null" -Level "DEBUG"
+        $args = @()  # Initialize as empty array
+    } else {
+        $args = $Arguments.Clone()
+    }
+
     $targetPort = $ExplicitPort
+    Write-Log "Initial target port: $targetPort" -Level "DEBUG"
 
     # If no explicit port, try to find one in args
-    if ($targetPort -eq 0) {
+    if ($targetPort -eq 0 -and $args.Count -gt 0) {
+        Write-Log "Searching for port in arguments..." -Level "DEBUG"
         for ($i = 0; $i -lt $args.Length - 1; $i++) {
+            Write-Log "Checking arg[$i]: $($args[$i])" -Level "DEBUG"
             if ($args[$i] -in @("-port", "--port", "-p")) {
                 try {
                     $targetPort = [int]$args[$i + 1]
+                    Write-Log "Found port in args: $targetPort" -Level "DEBUG"
                     break
                 }
                 catch {
@@ -144,30 +228,81 @@ function Get-ProcessedArgs {
     }
 
     if ($targetPort -eq 0) {
-        Write-Log "No port specified for server mode" -Level "DEBUG"
-        return $args
+        Write-Log "No port specified for server mode, using explicit port if available" -Level "DEBUG"
+        if ($ExplicitPort -gt 0) {
+            $targetPort = $ExplicitPort
+            Write-Log "Using explicit port: $targetPort" -Level "DEBUG"
+            # Add port to args since it's not there
+            $args += @("-port", $targetPort.ToString())
+            Write-Log "Added port to args: $($args -join ', ')" -Level "DEBUG"
+        } else {
+            Write-Log "No port specified anywhere, returning original args" -Level "DEBUG"
+            return $args
+        }
     }
 
-    Write-Log "Target port: $targetPort" -Level "DEBUG"
+    Write-Log "Target port determined: $targetPort" -Level "DEBUG"
 
-    if (-not (Test-PortAvailable -PortNumber $targetPort)) {
-        if ($StopExisting) {
-            Stop-PortProcess -PortNumber $targetPort
-        }
-        else {
-            $newPort = Find-AvailablePort -StartPort $targetPort
-            Write-Log "Replacing port $targetPort with $newPort" -Level "WARNING"
+    try {
+        $portAvailable = Test-PortAvailable -PortNumber $targetPort
+        Write-Log "Port $targetPort available: $portAvailable" -Level "DEBUG"
 
-            # Update port in args
-            for ($i = 0; $i -lt $args.Length - 1; $i++) {
-                if ($args[$i] -in @("-port", "--port", "-p")) {
-                    $args[$i + 1] = $newPort.ToString()
-                    break
+        if (-not $portAvailable) {
+            Write-Log "Port $targetPort is not available" -Level "DEBUG"
+            if ($StopExisting) {
+                Write-Log "Stopping existing processes on port $targetPort" -Level "DEBUG"
+                Stop-PortProcess -PortNumber $targetPort
+            }
+            else {
+                Write-Log "Finding alternative port..." -Level "DEBUG"
+                $newPort = Find-AvailablePort -StartPort $targetPort
+                Write-Log "Replacing port $targetPort with $newPort" -Level "WARNING"
+
+                # Update port in args - handle empty args properly
+                $portUpdated = $false
+                if ($args.Count -gt 1) {
+                    for ($i = 0; $i -lt $args.Length - 1; $i++) {
+                        if ($args[$i] -in @("-port", "--port", "-p")) {
+                            $args[$i + 1] = $newPort.ToString()
+                            $portUpdated = $true
+                            Write-Log "Updated existing port arg to: $newPort" -Level "DEBUG"
+                            break
+                        }
+                    }
                 }
+
+                # If port wasn't found in args, add it
+                if (-not $portUpdated) {
+                    $args += @("-port", $newPort.ToString())
+                    Write-Log "Added new port arg: $newPort" -Level "DEBUG"
+                }
+            }
+        } else {
+            Write-Log "Port $targetPort is available" -Level "DEBUG"
+            # Ensure port is in args if it's not already there
+            $portInArgs = $false
+            if ($args.Count -gt 1) {
+                for ($i = 0; $i -lt $args.Length - 1; $i++) {
+                    if ($args[$i] -in @("-port", "--port", "-p")) {
+                        $portInArgs = $true
+                        break
+                    }
+                }
+            }
+
+            if (-not $portInArgs -and $targetPort -gt 0) {
+                $args += @("-port", $targetPort.ToString())
+                Write-Log "Added port to args since it wasn't present: $targetPort" -Level "DEBUG"
             }
         }
     }
+    catch {
+        Write-Log "Error in port processing: $($_.Exception.Message)" -Level "ERROR"
+        Write-Log "Stack trace: $($_.ScriptStackTrace)" -Level "ERROR"
+        throw "Port processing failed: $($_.Exception.Message)"
+    }
 
+    Write-Log "Final processed args: $($args -join ', ')" -Level "DEBUG"
     return $args
 }
 
@@ -238,45 +373,107 @@ function Install-GoRuntime {
 $ErrorActionPreference = "Stop"
 
 try {
+    Write-Log "=== PyGoPS PowerShell Launcher Debug Information ===" -Level "INFO"
+    Write-Log "Working Directory: $(Get-Location)" -Level "DEBUG"
+    Write-Log "Script Directory: $($PSScriptRoot)" -Level "DEBUG"
+    Write-Log "Original GoFile parameter: $GoFile" -Level "DEBUG"
+    Write-Log "PowerShell Version: $($PSVersionTable.PSVersion)" -Level "DEBUG"
+
+    # Resolve the Go file path properly for both absolute and relative paths
+    $resolvedGoFile = if ([System.IO.Path]::IsPathRooted($GoFile)) {
+        # Absolute path - use as-is but verify it exists
+        Write-Log "GoFile is absolute path" -Level "DEBUG"
+        $GoFile
+    } else {
+        # Relative path - resolve against current working directory
+        Write-Log "GoFile is relative path" -Level "DEBUG"
+        $resolved = Resolve-Path $GoFile -ErrorAction SilentlyContinue
+        if ($resolved) {
+            $resolved.Path
+        } else {
+            # Try resolving against script directory
+            $scriptRelative = Join-Path $PSScriptRoot $GoFile
+            Write-Log "Trying script-relative path: $scriptRelative" -Level "DEBUG"
+            if (Test-Path $scriptRelative) {
+                $scriptRelative
+            } else {
+                throw "Could not resolve Go file path: $GoFile"
+            }
+        }
+    }
+
+    Write-Log "Resolved GoFile path: $resolvedGoFile" -Level "DEBUG"
+    Write-Log "GoFile exists: $(Test-Path $resolvedGoFile)" -Level "DEBUG"
+
+    if (-not (Test-Path $resolvedGoFile)) {
+        throw "Go file not found after path resolution: $resolvedGoFile"
+    }
+
     # Parse JSON arguments
+    Write-Log "Parsing GoArgs JSON: $GoArgs" -Level "DEBUG"
     try {
         $parsedArgs = ConvertFrom-Json $GoArgs
         if (-not ($parsedArgs -is [array])) {
             throw "GoArgs must be a JSON array"
         }
+        Write-Log "Parsed GoArgs: $($parsedArgs -join ', ')" -Level "DEBUG"
     }
     catch {
+        Write-Log "JSON parsing failed: $($_.Exception.Message)" -Level "ERROR"
         throw "Invalid JSON in GoArgs parameter: $($_.Exception.Message)"
     }
 
+    Write-Log "ServerMode: $($ServerMode.IsPresent)" -Level "DEBUG"
+    Write-Log "Port: $Port" -Level "DEBUG"
+    Write-Log "DryRun: $($DryRun.IsPresent)" -Level "DEBUG"
+
     # Ensure Go is installed
+    Write-Log "Checking Go installation..." -Level "DEBUG"
     Install-GoRuntime -Version $GoVersion -Force $ForceGoInstall.IsPresent
 
     # Process arguments for server mode
+    Write-Log "Processing arguments for server mode..." -Level "DEBUG"
     $processedArgs = Get-ProcessedArgs -Arguments $parsedArgs -IsServerMode $ServerMode.IsPresent -ExplicitPort $Port
+    Write-Log "Processed args: $($processedArgs -join ', ')" -Level "DEBUG"
 
-    # Build command
-    $command = @("run", $GoFile) + $processedArgs
+    # Build command - use the resolved path
+    $command = @("run", $resolvedGoFile) + $processedArgs
     $commandStr = "go " + ($command -join " ")
 
+    Write-Log "Final command array: $($command -join ' | ')" -Level "DEBUG"
     Write-Log "Executing: $commandStr" -Level "INFO"
 
     if ($DryRun) {
         Write-Log "[DRY RUN] Command would be executed" -Level "INFO"
+        Write-Log "[DRY RUN] Working directory would be: $(Get-Location)" -Level "INFO"
         exit 0
     }
 
-    # Execute Go command
-    & go @command
+    # Execute Go command with additional debugging
+    Write-Log "Starting Go execution..." -Level "DEBUG"
+    Write-Log "Go executable path: $(Get-Command go -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source)" -Level "DEBUG"
 
-    if ($LASTEXITCODE -eq 0) {
-        Write-Log "Execution completed successfully" -Level "SUCCESS"
+    try {
+        & go @command
+        $exitCode = $LASTEXITCODE
+        Write-Log "Go command completed with exit code: $exitCode" -Level "DEBUG"
+
+        if ($exitCode -eq 0) {
+            Write-Log "Execution completed successfully" -Level "SUCCESS"
+        }
+        else {
+            throw "Go execution failed with exit code: $exitCode"
+        }
     }
-    else {
-        throw "Go execution failed with exit code: $LASTEXITCODE"
+    catch {
+        Write-Log "Go execution threw exception: $($_.Exception.Message)" -Level "ERROR"
+        throw "Go execution failed: $($_.Exception.Message)"
     }
 }
 catch {
+    Write-Log "=== Error Details ===" -Level "ERROR"
     Write-Log "Error: $($_.Exception.Message)" -Level "ERROR"
+    Write-Log "Error Type: $($_.Exception.GetType().Name)" -Level "ERROR"
+    Write-Log "Stack Trace: $($_.ScriptStackTrace)" -Level "ERROR"
     exit 1
 }
