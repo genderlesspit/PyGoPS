@@ -5,7 +5,7 @@ from pathlib import Path
 from pygops import GoServer
 
 async def test_advanced():
-    path = Path.cwd() / "scripts" / "go_dummy.go"
+    path = Path.cwd() / "pygops" / "scripts" / "go_dummy.go"
     server = GoServer(str(path), port=3333, verbose=True)
     try:
         await server.start()
@@ -25,3 +25,5 @@ async def test_advanced():
     await server.stop()
 
 asyncio.run(test_advanced())
+
+time.sleep(300)
