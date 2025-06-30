@@ -16,13 +16,16 @@ class GoServer:
         self.kwargs = kwargs
         self.verbose = kwargs.get('verbose', False)
 
-        script_dir = Path(__file__).parent / "scripts"  # files are now under pygops/scripts
-        ps1_path   = script_dir / "go_launcher.ps1"
-        self.script_path = script_path or ps1_path
+        # script_dir = Path(__file__).parent / "scripts"  # files are now under pygops/scripts
+        # ps1_path   = script_dir / "go_launcher.ps1"
+        self.script_path = script_path
 
         if self.verbose:
-            log.debug(f"[GoServer] Script path: {self.script_path}")
-            log.debug(f"[GoServer] Script exists: {self.script_path.exists()}")
+            if self.script_path:
+                log.debug(f"{self}: Custom Script path: {self.script_path}")
+                log.debug(f"{self} Script exists: {self.script_path.exists()}")
+            else:
+                log.debug(f"{self}: No custom script path specified. Defaulting to template.")
 
         server_kwargs = {"is_server": True, **kwargs}
         self._launcher = GoLauncher(go_file, self.script_path, **server_kwargs)

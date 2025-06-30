@@ -9,7 +9,7 @@ from loguru import logger as log
 
 # noinspection PyUnboundLocalVariable
 class GoThread(threading.Thread):
-    """Ultra-lightweight thread that runs PowerShell with kwargs"""
+    """Ultra-lightweight thread that runs PowerShell with real-time output streaming"""
 
     def __init__(
         self, go_file: Path, script_path: Path, **kwargs: Any
@@ -72,66 +72,69 @@ class GoThread(threading.Thread):
 
         return cmd
 
-    def run(self):
-        """Run PowerShell script with all kwargs as parameters"""
-        stdout_lines = []
-        stderr_lines = []
+    def _stream_output(self, pipe, prefix: str):
+        """Stream output from a pipe in real-time"""
+        try:
+            for line in iter(pipe.readline, ''):
+                if line.strip():
+                    if self.verbose:
+                        log.debug(f"[{prefix}]: {line.strip()}")
+        except Exception as e:
+            log.error(f"Error streaming {prefix}: {e}")
+        finally:
+            pipe.close()
 
+    def run(self):
+        """Run PowerShell script with real-time output streaming"""
         try:
             cmd = self._build_command()
 
             if self.verbose:
                 log.debug(f"[GoThread] Running command: {' '.join(cmd)}")
 
-            cwd = Path(self.script_path).parent.resolve()        # …/gosql/main.go
+            # Use the Go project directory as working directory
+            go_dir = Path(self.go_file).parent.resolve()
 
             self._popen = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,  # Keep stderr separate for better error analysis
+                stderr=subprocess.PIPE,
                 text=True,
-                encoding='utf-8',  # Explicitly set encoding to avoid cp1252 issues
-                errors='replace',  # Replace problematic characters instead of crashing
-                cwd=str(cwd),  # Run from script directory
-                universal_newlines=True
+                encoding='utf-8',
+                errors='replace',
+                cwd=str(go_dir),  # Run from Go project directory
+                universal_newlines=True,
+                bufsize=1  # Line buffered for real-time output
             )
 
-            # Use communicate() to properly capture both stdout and stderr
-            stdout_output, stderr_output = self._popen.communicate()
+            # Create threads for streaming stdout and stderr in real-time
+            stdout_thread = threading.Thread(
+                target=self._stream_output,
+                args=(self._popen.stdout, "GO-OUT"),
+                daemon=True
+            )
+            stderr_thread = threading.Thread(
+                target=self._stream_output,
+                args=(self._popen.stderr, "GO-ERR"),
+                daemon=True
+            )
 
-            # Process stdout
-            if stdout_output and stdout_output.strip():
-                stdout_lines = stdout_output.strip().split('\n')
-                if self.verbose:
-                    for line in stdout_lines:
-                        if line.strip():
-                            log.debug(f"[PS]: {line.strip()}")
+            # Start streaming threads
+            stdout_thread.start()
+            stderr_thread.start()
 
-            # Process stderr
-            if stderr_output and stderr_output.strip():
-                stderr_lines = stderr_output.strip().split('\n')
-                if self.verbose:
-                    for line in stderr_lines:
-                        if line.strip():
-                            log.debug(f"[PS-ERR]: {line.strip()}")
+            # Wait for the process to complete
+            ret = self._popen.wait()
 
-            self._popen.wait()
-            ret = self._popen.returncode
+            # Wait for streaming threads to finish
+            stdout_thread.join(timeout=1)
+            stderr_thread.join(timeout=1)
 
             if ret == 0:
                 if self.verbose:
                     log.success(f"[GoThread] Process completed successfully")
             else:
                 # Detailed error reporting
-                error_context = {
-                    "exit_code": ret,
-                    "command": ' '.join(cmd),
-                    "go_file": self.go_file,
-                    "script_path": str(self.script_path),
-                    "kwargs": self.kwargs
-                }
-
-                # Common PowerShell exit codes
                 exit_code_meanings = {
                     1: "General PowerShell error",
                     2: "Misuse of shell command",
@@ -150,17 +153,7 @@ class GoThread(threading.Thread):
                 log.error(f"  Command: {' '.join(cmd)}")
                 log.error(f"  Go File: {self.go_file}")
                 log.error(f"  Script: {self.script_path}")
-
-                if stderr_lines:
-                    log.error("  STDERR Output:")
-                    for line in stderr_lines:
-                        log.error(f"    {line}")
-
-                if stdout_lines:
-                    log.error("  Last STDOUT Output:")
-                    # Show last few lines of stdout for context
-                    for line in stdout_lines[-10:]:
-                        log.error(f"    {line}")
+                log.error(f"  Working Directory: {go_dir}")
 
                 # Specific suggestions based on exit code
                 if ret == 4294770688:
@@ -173,7 +166,10 @@ class GoThread(threading.Thread):
                 elif ret == 4294967295:
                     log.error("  → PowerShell execution policy may be blocking script")
                     log.error("  → Try: Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope CurrentUser")
-                raise SubprocessError
+                
+                # Don't raise exception for server processes that exit normally
+                if not self.kwargs.get('is_server', False):
+                    raise SubprocessError
 
         except FileNotFoundError:
             log.error(f"[GoThread] PowerShell not found - ensure PowerShell is installed")
@@ -188,10 +184,6 @@ class GoThread(threading.Thread):
             log.error(f"[GoThread] Unexpected error during PowerShell execution: {e}")
             log.error(f"  Error type: {type(e).__name__}")
             log.error(f"  Command: {' '.join(cmd) if 'cmd' in locals() else 'N/A'}")
-            if stdout_lines:
-                log.error("  Captured output before error:")
-                for line in stdout_lines[-5:]:
-                    log.error(f"    {line}")
             raise Exception
 
     def terminate(self):
