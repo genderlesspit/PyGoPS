@@ -85,7 +85,7 @@ class GoThread(threading.Thread):
                 text=True,
                 encoding='utf-8',  # Explicitly set encoding to avoid cp1252 issues
                 errors='replace',  # Replace problematic characters instead of crashing
-                cwd=str(Path(self.script_path).parent),  # Run from script directory
+                cwd=str(Path(self.go_file).parent),  # Run from script directory
                 universal_newlines=True
             )
 
