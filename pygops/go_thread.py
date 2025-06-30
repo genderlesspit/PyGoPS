@@ -26,10 +26,14 @@ class GoThread(threading.Thread):
 
     def _build_command(self) -> List[str]:
         """Build PowerShell command with proper parameter mapping"""
+
+        ps1_path = Path(self.script_path).resolve()    # …/site-packages/pygops/scripts/go_launcher.ps1
+        go_file  = Path(self.go_file).resolve()        # …/gosql/main.go
+
         cmd = [
             "powershell", "-ExecutionPolicy", "Bypass",
-            "-File", str(self.script_path),
-            "-GoFile", self.go_file
+            "-File", str(ps1_path),
+            "-GoFile", str(go_file)
         ]
 
         # Handle go_args - convert list to JSON string if provided
@@ -78,6 +82,8 @@ class GoThread(threading.Thread):
             if self.verbose:
                 log.debug(f"[GoThread] Running command: {' '.join(cmd)}")
 
+            cwd = Path(self.script_path).parent.resolve()        # …/gosql/main.go
+
             self._popen = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -85,7 +91,7 @@ class GoThread(threading.Thread):
                 text=True,
                 encoding='utf-8',  # Explicitly set encoding to avoid cp1252 issues
                 errors='replace',  # Replace problematic characters instead of crashing
-                cwd=str(Path(self.go_file).parent),  # Run from script directory
+                cwd=str(cwd),  # Run from script directory
                 universal_newlines=True
             )
 

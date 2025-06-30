@@ -4,20 +4,20 @@ from pathlib import Path
 from typing import Optional
 from loguru import logger as log
 
-from . import get_go_launcher_script
 from .go_launcher import GoLauncher
 
 
 class GoServer:
     """Ultra-lightweight Go server manager"""
 
-    def __init__(self, go_file, script_path: Optional[Path] = None, **kwargs):
+    def __init__(self, go_file: Path, script_path: Optional[Path] = None, **kwargs):
         self.go_file = go_file
         self.kwargs = kwargs
         self.verbose = kwargs.get('verbose', False)
 
-        # Use the script path from __init__.py or provided path
-        self.script_path = script_path or get_go_launcher_script()
+        script_dir = Path(__file__).parent / "scripts"  # files are now under pygops/scripts
+        ps1_path   = script_dir / "go_launcher.ps1"
+        self.script_path = script_path or ps1_path
 
         if self.verbose:
             log.debug(f"[GoServer] Script path: {self.script_path}")
