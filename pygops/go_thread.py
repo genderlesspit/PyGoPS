@@ -7,11 +7,12 @@ from typing import Any, List
 from loguru import logger as log
 
 
+# noinspection PyUnboundLocalVariable
 class GoThread(threading.Thread):
     """Ultra-lightweight thread that runs PowerShell with kwargs"""
 
     def __init__(
-        self, go_file: str, script_path: Path, **kwargs: Any
+        self, go_file: Path, script_path: Path, **kwargs: Any
     ):
         super().__init__(daemon=True)
         self.go_file = go_file

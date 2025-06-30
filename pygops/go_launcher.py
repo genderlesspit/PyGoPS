@@ -9,7 +9,7 @@ from .go_thread import GoThread
 class GoLauncher:
     """Ultra-lightweight launcher backed by PortManager for automatic port allocation and cleanup."""
 
-    def __init__(self, go_file: str, script_path: Path, **kwargs):
+    def __init__(self, go_file: Path, script_path: Path, **kwargs):
         self.go_file = go_file
         self.script_path = script_path
         self.verbose = kwargs.get('verbose', False)

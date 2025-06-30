@@ -7,6 +7,7 @@ from loguru import logger as log
 from .go_launcher import GoLauncher
 
 
+# noinspection PyProtectedMember,PyBroadException
 class GoServer:
     """Ultra-lightweight Go server manager"""
 
